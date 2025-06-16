@@ -25,7 +25,7 @@ export const recordsRoutes = (app: Elysia) => {
       console.log(`User ${user.email} accessing records for collection "${params.collectionName}"`);
     })
     .post('/', async ({ params, body, set }) => {
-      const { record, errors } = await recordService.createRecord(params.collectionName, body as Record<string, any>);
+      const { record, errors } = await recordService.createRecord(params.collectionName, body as Record<string, any>, user);
       if (errors) {
         set.status = 400;
         return { message: 'Failed to create record', errors };
@@ -42,7 +42,7 @@ export const recordsRoutes = (app: Elysia) => {
       const page = query.page ? parseInt(query.page as string, 10) : 1;
       const perPage = query.perPage ? parseInt(query.perPage as string, 10) : 30;
 
-      const { records, total, errors, page: resPage, perPage: resPerPage, totalPages } = await recordService.listRecords(params.collectionName, { page, perPage });
+      const { records, total, errors, page: resPage, perPage: resPerPage, totalPages } = await recordService.listRecords(params.collectionName, { page, perPage }, user);
       if (errors) {
         set.status = 400; // Or 404 if collection not found
         return { message: 'Failed to list records', errors };
@@ -64,7 +64,7 @@ export const recordsRoutes = (app: Elysia) => {
       detail: { summary: 'List records from a collection' }
     })
     .get('/:recordId', async ({ params, set }) => {
-      const { record, errors } = await recordService.getRecordById(params.collectionName, params.recordId);
+      const { record, errors } = await recordService.getRecordById(params.collectionName, params.recordId, user);
       if (errors) {
         set.status = 404; // Typically 404 if record or collection not found
         return { message: 'Failed to get record', errors };
@@ -75,7 +75,7 @@ export const recordsRoutes = (app: Elysia) => {
       detail: { summary: 'Get a specific record by ID' }
     })
     .patch('/:recordId', async ({ params, body, set }) => {
-      const { record, errors } = await recordService.updateRecord(params.collectionName, params.recordId, body as Record<string, any>);
+      const { record, errors } = await recordService.updateRecord(params.collectionName, params.recordId, body as Record<string, any>, user);
       if (errors) {
         set.status = errors.includes('not found') ? 404 : 400;
         return { message: 'Failed to update record', errors };
@@ -87,7 +87,7 @@ export const recordsRoutes = (app: Elysia) => {
       detail: { summary: 'Update an existing record by ID' }
     })
     .delete('/:recordId', async ({ params, set }) => {
-      const { success, errors } = await recordService.deleteRecord(params.collectionName, params.recordId);
+      const { success, errors } = await recordService.deleteRecord(params.collectionName, params.recordId, user);
       if (errors || !success) {
         set.status = 404; // Or 400
         return { message: 'Failed to delete record', errors };

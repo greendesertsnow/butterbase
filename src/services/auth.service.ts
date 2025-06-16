@@ -3,6 +3,7 @@ import { getDB } from './database';
 import { User } from '../models/user';
 import * as userService from './user.service';
 import * as jose from 'jose';
+import * as emailService from './email.service';
 import { randomUUID } from 'crypto'; // For generating unique tokens
 
 // --- JWT Configuration ---
@@ -137,6 +138,10 @@ export async function requestEmailVerification(email: string): Promise<{ verific
   }
 
   console.log(`Verification token generated for ${email}: ${verificationToken}`);
+  // Send verification email
+  if (user) {
+    emailService.sendVerificationEmail(user.email, user.name, verificationToken).catch(console.error);
+  }
   // In a real app, an EmailService would now send an email with this token.
   return { verificationToken };
 }
@@ -182,6 +187,10 @@ export async function requestPasswordReset(email: string): Promise<{ resetToken:
   }
 
   console.log(`Password reset token generated for ${email}: ${resetToken}`);
+  // Send password reset email
+  if (user) {
+    emailService.sendPasswordResetEmail(user.email, user.name, resetToken, TOKEN_EXPIRATION_HOURS).catch(console.error);
+  }
   // EmailService would send an email with this token.
   return { resetToken };
 }

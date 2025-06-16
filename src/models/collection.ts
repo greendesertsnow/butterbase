@@ -7,6 +7,7 @@ export type FieldSchema = {
   system: boolean;
   required: boolean;
   options: any; // Field-specific options
+  hidden?: boolean; // Added for hidden field logic
 };
 
 export interface Collection extends BaseModel {
@@ -32,7 +33,8 @@ export const FieldSchemaValidation = t.Object({
   type: t.String(), // TODO: t.Union for specific field types
   system: t.Boolean(),
   required: t.Boolean(),
-  options: t.Any() // Field-specific options, t.Record(t.String(), t.Any())
+  options: t.Any(), // Field-specific options, t.Record(t.String(), t.Any())
+  hidden: t.Optional(t.Boolean({default: false})) // Added for hidden field logic
 });
 
 export const CollectionSchema = t.Object({

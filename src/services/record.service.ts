@@ -1,350 +1,211 @@
 import { getDB } from './database';
 import { Collection, FieldSchema } from '../models/collection';
-import * as collectionService from './collection.service'; // To get collection schema
-import { Database, Statement } from 'bun:sqlite';
+import * as collectionService from './collection.service';
+import * as ruleService from './rule.service';
+import { AuthUser } from '../routes/auth';
+import { appEvents, RecordCreatePayload, RecordUpdatePayload, RecordDeletePayload, RecordOperationSuccessPayload, RecordOperationErrorPayload } from './event.service';
+import { isUserAdmin } from '../utils/auth.utils';
+import { Database } from 'bun:sqlite';
 
-// --- Data Validation and Coercion ---
-
-// Basic validator and coercer based on field schema
-// TODO: Expand with more robust validation (min/max length, regex, specific formats like email/url)
 function validateAndCoerce(value: any, field: FieldSchema): { value?: any; error?: string } {
-  if (value === undefined || value === null) {
-    if (field.required) {
-      return { error: `Field "${field.name}" is required.` };
-    }
-    return { value: null }; // Explicitly null for DB if not required and not provided
-  }
-
+  if (value === undefined || value === null) { if (field.required) return { error: `Field "${field.name}" is required.` }; return { value: null }; }
   switch (field.type.toLowerCase()) {
-    case 'text':
-    case 'email':
-    case 'url':
-    case 'editor':
-    case 'select':
-      if (typeof value !== 'string') return { error: `Field "${field.name}" must be a string.` };
-      // TODO: Add length validation from field.options
-      return { value };
-    case 'number':
-      const num = Number(value);
-      if (isNaN(num)) return { error: `Field "${field.name}" must be a number.` };
-      // TODO: Add min/max validation from field.options
-      return { value: num };
-    case 'bool':
-      if (typeof value !== 'boolean') return { error: `Field "${field.name}" must be a boolean.` };
-      return { value: value ? 1 : 0 }; // Coerce to integer for SQLite
-    case 'date':
-      // Expect ISO8601 string, store as TEXT. Validate format.
-      if (typeof value !== 'string' || isNaN(new Date(value).getTime())) {
-        return { error: `Field "${field.name}" must be a valid ISO8601 date string.`};
-      }
-      return { value };
-    case 'json':
-      try {
-        // If it's already an object/array, stringify for storage.
-        // If it's a string, try to parse to ensure it's valid JSON.
-        const V = typeof value === 'string' ? JSON.parse(value) : value;
-        return { value: JSON.stringify(V) };
-      } catch (e) {
-        return { error: `Field "${field.name}" must be valid JSON or a JSON string.` };
-      }
-    case 'file': // Assuming we store a file key (string) or array of keys
-      if (typeof value !== 'string' && (!Array.isArray(value) || !value.every(v => typeof v === 'string'))) {
-        return { error: `Field "${field.name}" must be a string or an array of strings (file keys).` };
-      }
-      // If it's an array, store as JSON string. If single, as TEXT.
-      // This depends on how 'file' field options (maxSelect) are handled.
-      // For simplicity, let's assume single file key stored as TEXT for now.
-      if (Array.isArray(value)) { // If multiple files allowed by field.options.maxSelect > 1
-          return { value: JSON.stringify(value) };
-      }
-      return { value }; // Single file key
-    default:
-      return { value }; // Unknown type, pass through
+    case 'text': case 'email': case 'url': case 'editor': case 'select': if (typeof value !== 'string') return { error: `Field "${field.name}" must be a string.` }; return { value };
+    case 'number': const num = Number(value); if (isNaN(num)) return { error: `Field "${field.name}" must be a number.` }; return { value: num };
+    case 'bool': if (typeof value !== 'boolean') return { error: `Field "${field.name}" must be a boolean.` }; return { value: value ? 1 : 0 };
+    case 'date': if (typeof value !== 'string' || isNaN(new Date(value).getTime())) return { error: `Field "${field.name}" must be a valid ISO8601 date string.`}; return { value };
+    case 'json': try { const V = typeof value === 'string' ? JSON.parse(value) : value; return { value: JSON.stringify(V) }; } catch (e) { return { error: `Field "${field.name}" must be valid JSON or a JSON string.` }; }
+    case 'file': if (typeof value !== 'string' && (!Array.isArray(value) || !value.every(v => typeof v === 'string'))) return { error: `Field "${field.name}" must be a string or an array of strings.`}; if (Array.isArray(value)) return { value: JSON.stringify(value) }; return { value };
+    default: return { value };
   }
 }
-
-
-// --- Record CRUD Operations ---
+function prepareRecordForEvent(record: Record<string, any>, collection: Collection): Record<string, any> {
+    const processedRecord = JSON.parse(JSON.stringify(record));
+    collection.fields.forEach(field => {
+        if (processedRecord.hasOwnProperty(field.name) && processedRecord[field.name] !== null) {
+            if (field.type.toLowerCase() === 'bool') processedRecord[field.name] = Boolean(processedRecord[field.name]);
+            else if (field.type.toLowerCase() === 'json' && typeof processedRecord[field.name] === 'string') try { processedRecord[field.name] = JSON.parse(processedRecord[field.name]); } catch (e) {}
+            else if (field.type.toLowerCase() === 'file' && typeof processedRecord[field.name] === 'string') try { const parsed = JSON.parse(processedRecord[field.name]); if(Array.isArray(parsed)) processedRecord[field.name] = parsed; } catch(e) {}
+        }
+    }); return processedRecord;
+}
 
 export async function createRecord(
-  collectionName: string,
-  data: Record<string, any>,
-  db?: Database
+  collectionName: string, data: Record<string, any>, authContext?: AuthUser | null, db?: Database
 ): Promise<{ record?: Record<string, any>; errors?: string[] }> {
   const dbInstance = db || getDB();
   const collection = await collectionService.getCollectionByIdOrName(collectionName, dbInstance);
-  if (!collection) {
-    return { errors: [`Collection "${collectionName}" not found.`] };
+  if (!collection) { return { errors: [`Collection "${collectionName}" not found.`] }; }
+
+  const createPayload: RecordCreatePayload = { record: data, collection, actor: authContext };
+  try {
+    await appEvents.emitStoppable('beforeRecordCreate', createPayload);
+  } catch (eventError: any) { return { errors: [`beforeRecordCreate event hook failed: ${eventError.message}`] }; }
+
+  const currentData = createPayload.record;
+
+  if (collection.createRule && collection.createRule.trim() !== '') {
+    const ruleEval = ruleService.evaluateRule(collection.createRule, { authRecord: authContext, requestData: currentData });
+    if (ruleEval.error) { return { errors: [ruleEval.error] }; }
+    if (ruleEval.allow === false || (ruleEval.condition && ruleEval.condition.sql === '1=0')) { return { errors: ['Access denied by create rule.'] };}
   }
 
-  // TODO: Implement rule checking (collection.createRule)
-
-  const recordId = 'r' + Math.random().toString(36).substring(2, 9) + Math.random().toString(36).substring(2, 9);
-  const now = new Date().toISOString();
-
-  const fieldNames: string[] = ['id', 'created', 'updated'];
-  const valuePlaceholders: string[] = ['?', '?', '?'];
-  const values: any[] = [recordId, now, now];
+  const recordId = 'r' + Math.random().toString(36).substring(2,9)+Math.random().toString(36).substring(2,9); const now = new Date().toISOString();
+  const fieldNames: string[] = ['id', 'created', 'updated']; const valuePlaceholders: string[] = ['?', '?', '?']; const values: any[] = [recordId, now, now];
   const validationErrors: string[] = [];
 
   for (const field of collection.fields) {
-    if (data.hasOwnProperty(field.name)) {
-      const validationResult = validateAndCoerce(data[field.name], field);
-      if (validationResult.error) {
-        validationErrors.push(validationResult.error);
-      } else {
-        fieldNames.push(`"${field.name}"`); // Quote field name
-        valuePlaceholders.push('?');
-        values.push(validationResult.value);
-      }
-    } else if (field.required) {
-      validationErrors.push(`Field "${field.name}" is required.`);
-    }
-    // Non-required fields not in data are omitted, will get DB default or NULL
+    if (field.hidden && !isUserAdmin(authContext)) { if (currentData.hasOwnProperty(field.name)) validationErrors.push(`Field "${field.name}" is hidden.`); continue; }
+    if (currentData.hasOwnProperty(field.name)) {
+      const res = validateAndCoerce(currentData[field.name], field); if (res.error) validationErrors.push(res.error); else { fieldNames.push(`"${field.name}"`); valuePlaceholders.push('?'); values.push(res.value); }
+    } else if (field.required) validationErrors.push(`Field "${field.name}" is required.`);
   }
-
-  if (validationErrors.length > 0) {
-    return { errors: validationErrors };
-  }
-  if (fieldNames.length === 3) { // Only id, created, updated
-      return { errors: ["Cannot create an empty record. No valid fields provided."] };
-  }
+  if (validationErrors.length > 0) { return { errors: validationErrors }; }
+  if (fieldNames.length === 3) { return { errors: ["No valid fields provided."] }; }
 
   const query = `INSERT INTO "${collection.name}" (${fieldNames.join(', ')}) VALUES (${valuePlaceholders.join(', ')}) RETURNING *;`;
-
   try {
-    const stmt = dbInstance.prepare(query);
-    const newRecord = stmt.get(...values) as Record<string, any>;
-
-    // Coerce boolean fields back from 0/1 and parse JSON fields
-    if (newRecord) {
-        collection.fields.forEach(field => {
-            if (newRecord.hasOwnProperty(field.name) && newRecord[field.name] !== null) {
-                if (field.type.toLowerCase() === 'bool') {
-                    newRecord[field.name] = Boolean(newRecord[field.name]);
-                } else if (field.type.toLowerCase() === 'json' && typeof newRecord[field.name] === 'string') {
-                    try { newRecord[field.name] = JSON.parse(newRecord[field.name]); } catch (e) { /* ignore parse error on read */ }
-                } else if (field.type.toLowerCase() === 'file' && typeof newRecord[field.name] === 'string') {
-                    // Attempt to parse if it might be a JSON array of file keys
-                    try {
-                        const parsed = JSON.parse(newRecord[field.name]);
-                        if (Array.isArray(parsed)) {
-                           newRecord[field.name] = parsed;
-                        }
-                    } catch (e) { /* ignore if not a JSON array, keep as string */ }
-                }
-            }
-        });
+    const stmt = dbInstance.prepare(query); const newRecordDb = stmt.get(...values) as Record<string, any>;
+    if (newRecordDb) {
+      const finalRecord = prepareRecordForEvent(newRecordDb, collection);
+      appEvents.emit('afterRecordCreateSuccess', { record: finalRecord, collection, actor: authContext });
+      return { record: finalRecord };
     }
-    return { record: newRecord };
-  } catch (error) {
-    console.error(`Error creating record in "${collection.name}":`, error);
-    return { errors: [error.message] };
-  }
-}
-
-export async function getRecordById(
-  collectionName: string,
-  recordId: string,
-  db?: Database
-): Promise<{ record?: Record<string, any>; errors?: string[] }> {
-  const dbInstance = db || getDB();
-  const collection = await collectionService.getCollectionByIdOrName(collectionName, dbInstance);
-  if (!collection) {
-    return { errors: [`Collection "${collectionName}" not found.`] };
-  }
-
-  // TODO: Implement rule checking (collection.viewRule)
-
-  const query = `SELECT * FROM "${collection.name}" WHERE id = ?;`;
-  try {
-    const stmt = dbInstance.prepare(query);
-    const record = stmt.get(recordId) as Record<string, any>;
-    if (!record) {
-      return { errors: [`Record with ID "${recordId}" not found in "${collectionName}".`] };
-    }
-    // Coerce boolean fields back from 0/1 and parse JSON fields
-    collection.fields.forEach(field => {
-        if (record.hasOwnProperty(field.name) && record[field.name] !== null) {
-            if (field.type.toLowerCase() === 'bool') {
-                record[field.name] = Boolean(record[field.name]);
-            } else if (field.type.toLowerCase() === 'json' && typeof record[field.name] === 'string') {
-                try { record[field.name] = JSON.parse(record[field.name]); } catch (e) { /* ignore */ }
-            } else if (field.type.toLowerCase() === 'file' && typeof record[field.name] === 'string') {
-                 try {
-                        const parsed = JSON.parse(record[field.name]);
-                        if (Array.isArray(parsed)) {
-                           record[field.name] = parsed;
-                        }
-                    } catch (e) { /* ignore */ }
-            }
-        }
-    });
-    return { record };
-  } catch (error) {
-    console.error(`Error fetching record "${recordId}" from "${collection.name}":`, error);
-    return { errors: [error.message] };
-  }
-}
-
-export async function listRecords(
-  collectionName: string,
-  options?: { filter?: string; sort?: string; page?: number; perPage?: number }, // TODO: Implement filter, sort, pagination
-  db?: Database
-): Promise<{ records?: Record<string, any>[]; total?: number; page?: number; perPage?: number; totalPages?: number; errors?: string[] }> {
-  const dbInstance = db || getDB();
-  const collection = await collectionService.getCollectionByIdOrName(collectionName, dbInstance);
-  if (!collection) {
-    return { errors: [`Collection "${collectionName}" not found.`] };
-  }
-
-  // TODO: Implement rule checking (collection.listRule)
-  // TODO: Implement filtering and sorting based on PocketBase filter syntax
-
-  let query = `SELECT * FROM "${collection.name}"`;
-  const countQuery = `SELECT COUNT(*) as total FROM "${collection.name}"`;
-
-  const perPage = options?.perPage || 30;
-  const page = options?.page || 1;
-  query += ` LIMIT ${perPage} OFFSET ${(page - 1) * perPage}`;
-
-  try {
-    const stmt = dbInstance.prepare(query);
-    const records = stmt.all() as Record<string, any>[];
-
-    const countStmt = dbInstance.prepare(countQuery);
-    const { total } = countStmt.get() as { total: number };
-
-    // Coerce boolean fields and parse JSON for each record
-    const processedRecords = records.map(record => {
-        const processedRecord = { ...record };
-        collection.fields.forEach(field => {
-            if (processedRecord.hasOwnProperty(field.name) && processedRecord[field.name] !== null) {
-                if (field.type.toLowerCase() === 'bool') {
-                    processedRecord[field.name] = Boolean(processedRecord[field.name]);
-                } else if (field.type.toLowerCase() === 'json' && typeof processedRecord[field.name] === 'string') {
-                    try { processedRecord[field.name] = JSON.parse(processedRecord[field.name]); } catch (e) { /* ignore */ }
-                } else if (field.type.toLowerCase() === 'file' && typeof processedRecord[field.name] === 'string') {
-                    try {
-                        const parsed = JSON.parse(processedRecord[field.name]);
-                        if (Array.isArray(parsed)) {
-                           processedRecord[field.name] = parsed;
-                        }
-                    } catch (e) { /* ignore */ }
-                }
-            }
-        });
-        return processedRecord;
-    });
-
-    return { records: processedRecords, total, page, perPage, totalPages: Math.ceil(total / perPage) };
-  } catch (error) {
-    console.error(`Error listing records from "${collection.name}":`, error);
-    return { errors: [error.message] };
+    throw new Error("Failed to retrieve record after creation.");
+  } catch (error: any) {
+    appEvents.emit('afterRecordCreateError', { record: currentData, collection, actor: authContext, error });
+    console.error(`Error creating record in "${collection.name}":`, error); return { errors: [error.message] };
   }
 }
 
 export async function updateRecord(
-  collectionName: string,
-  recordId: string,
-  data: Record<string, any>,
-  db?: Database
+  collectionName: string, recordId: string, data: Record<string, any>, authContext?: AuthUser | null, db?: Database
 ): Promise<{ record?: Record<string, any>; errors?: string[] }> {
   const dbInstance = db || getDB();
   const collection = await collectionService.getCollectionByIdOrName(collectionName, dbInstance);
-  if (!collection) {
-    return { errors: [`Collection "${collectionName}" not found.`] };
+  if (!collection) { return { errors: [`Collection "${collectionName}" not found.`] }; }
+
+  const existingRecordResult = await getRecordById(collectionName, recordId, authContext, dbInstance);
+  if (existingRecordResult.errors || !existingRecordResult.record) { return { errors: existingRecordResult.errors || [`Record not found or not accessible.`] }; }
+  const oldRecord = existingRecordResult.record;
+
+  const updatePayload: RecordUpdatePayload = { record: data, oldRecord, collection, actor: authContext };
+  try {
+    await appEvents.emitStoppable('beforeRecordUpdate', updatePayload);
+  } catch (eventError: any) { return { errors: [`beforeRecordUpdate event hook failed: ${eventError.message}`] }; }
+
+  const currentData = updatePayload.record;
+
+  if (collection.updateRule && collection.updateRule.trim() !== '') {
+    const ruleEval = ruleService.evaluateRule(collection.updateRule, { authRecord: authContext, requestData: currentData });
+    if (ruleEval.error) { return { errors: [ruleEval.error] }; }
+    if (ruleEval.allow === false || (ruleEval.condition && ruleEval.condition.sql === '1=0')) { return { errors: ['Access denied by update rule.'] };}
   }
 
-  // TODO: Implement rule checking (collection.updateRule)
-  const existingCheck = await getRecordById(collectionName, recordId, dbInstance);
-  if (existingCheck.errors || !existingCheck.record) {
-      return { errors: existingCheck.errors || [`Record with ID "${recordId}" not found for update.`] };
-  }
-
-  const now = new Date().toISOString();
-  const setClauses: string[] = [`"updated" = ?`];
-  const values: any[] = [now];
-  const validationErrors: string[] = [];
-
+  const now = new Date().toISOString(); const setClauses: string[] = [`"updated" = ?`]; const values: any[] = [now]; const validationErrors: string[] = [];
   for (const field of collection.fields) {
-    if (data.hasOwnProperty(field.name)) {
-      const validationResult = validateAndCoerce(data[field.name], field);
-      if (validationResult.error) {
-        validationErrors.push(validationResult.error);
-      } else {
-        setClauses.push(`"${field.name}" = ?`);
-        values.push(validationResult.value);
-      }
+    if (currentData.hasOwnProperty(field.name)) {
+      if (field.hidden && !isUserAdmin(authContext)) { validationErrors.push(`Field "${field.name}" is hidden.`); continue; }
+      const res = validateAndCoerce(currentData[field.name], field); if (res.error) validationErrors.push(res.error); else { setClauses.push(`"${field.name}" = ?`); values.push(res.value); }
     }
   }
-
-  if (validationErrors.length > 0) {
-    return { errors: validationErrors };
-  }
-  if (setClauses.length === 1) {
-    return { errors: ["No valid fields provided for update."] };
-  }
-
-  values.push(recordId); // For WHERE id = ?
+  if (validationErrors.length > 0) { return { errors: validationErrors }; }
+  if (setClauses.length === 1) { return { errors: ["No valid fields for update."] }; }
+  values.push(recordId);
 
   const query = `UPDATE "${collection.name}" SET ${setClauses.join(', ')} WHERE id = ? RETURNING *;`;
-
   try {
-    const stmt = dbInstance.prepare(query);
-    const updatedRecord = stmt.get(...values) as Record<string, any>;
-
-     if (updatedRecord) {
-        collection.fields.forEach(field => {
-            if (updatedRecord.hasOwnProperty(field.name) && updatedRecord[field.name] !== null) {
-                if (field.type.toLowerCase() === 'bool') {
-                    updatedRecord[field.name] = Boolean(updatedRecord[field.name]);
-                } else if (field.type.toLowerCase() === 'json' && typeof updatedRecord[field.name] === 'string') {
-                    try { updatedRecord[field.name] = JSON.parse(updatedRecord[field.name]); } catch (e) { /* ignore */ }
-                } else if (field.type.toLowerCase() === 'file' && typeof updatedRecord[field.name] === 'string') {
-                     try {
-                        const parsed = JSON.parse(updatedRecord[field.name]);
-                        if (Array.isArray(parsed)) {
-                           updatedRecord[field.name] = parsed;
-                        }
-                    } catch (e) { /* ignore */ }
-                }
-            }
-        });
-    }
-    return { record: updatedRecord };
-  } catch (error) {
-    console.error(`Error updating record "${recordId}" in "${collection.name}":`, error);
-    return { errors: [error.message] };
+    const stmt = dbInstance.prepare(query); const updatedRecordDb = stmt.get(...values) as Record<string, any>;
+    if (!updatedRecordDb) { throw new Error('Failed to retrieve record after update.'); }
+    const finalRecord = prepareRecordForEvent(updatedRecordDb, collection);
+    appEvents.emit('afterRecordUpdateSuccess', { record: finalRecord, oldRecord, collection, actor: authContext });
+    return { record: finalRecord };
+  } catch (error: any) {
+    appEvents.emit('afterRecordUpdateError', { record: currentData, oldRecord, collection, actor: authContext, error });
+    console.error(`Error updating record "${recordId}" in "${collection.name}":`, error); return { errors: [error.message] };
   }
 }
 
 export async function deleteRecord(
-  collectionName: string,
-  recordId: string,
-  db?: Database
+  collectionName: string, recordId: string, authContext?: AuthUser | null, db?: Database
 ): Promise<{ success?: boolean; errors?: string[] }> {
   const dbInstance = db || getDB();
   const collection = await collectionService.getCollectionByIdOrName(collectionName, dbInstance);
-  if (!collection) {
-    return { errors: [`Collection "${collectionName}" not found.`] };
-  }
+  if (!collection) { return { errors: [`Collection "${collectionName}" not found.`] }; }
 
-  // TODO: Implement rule checking (collection.deleteRule)
+  const existingRecordResult = await getRecordById(collectionName, recordId, authContext, dbInstance);
+  if (existingRecordResult.errors || !existingRecordResult.record) { return { errors: existingRecordResult.errors || [`Record not found or not accessible for deletion.`] }; }
+  const recordToDelete = existingRecordResult.record;
+
+  const deletePayload: RecordDeletePayload = { record: recordToDelete, collection, actor: authContext };
+  try {
+    await appEvents.emitStoppable('beforeRecordDelete', deletePayload);
+  } catch (eventError: any) { return { errors: [`beforeRecordDelete event hook failed: ${eventError.message}`] }; }
+
+  if (collection.deleteRule && collection.deleteRule.trim() !== '') {
+    const ruleEval = ruleService.evaluateRule(collection.deleteRule, { authRecord: authContext });
+    if (ruleEval.error) { return { errors: [ruleEval.error] }; }
+    if (ruleEval.allow === false || (ruleEval.condition && ruleEval.condition.sql === '1=0')) { return { errors: ['Access denied by delete rule.'] };}
+  }
 
   const query = `DELETE FROM "${collection.name}" WHERE id = ?;`;
   try {
-    const stmt = dbInstance.prepare(query);
-    stmt.run(recordId);
-    const changes = dbInstance.changes;
-    if (changes === 0) {
-        return { errors: [`Record with ID "${recordId}" not found in "${collectionName}" or already deleted.`] };
-    }
+    const stmt = dbInstance.prepare(query); stmt.run(recordId);
+    if (dbInstance.changes === 0) { throw new Error("Record not found or already deleted (or rule prevented)."); }
+    appEvents.emit('afterRecordDeleteSuccess', { record: recordToDelete, collection, actor: authContext });
     return { success: true };
-  } catch (error) {
-    console.error(`Error deleting record "${recordId}" from "${collection.name}":`, error);
-    return { errors: [error.message] };
+  } catch (error: any) {
+    appEvents.emit('afterRecordDeleteError', { record: recordToDelete, collection, actor: authContext, error });
+    console.error(`Error deleting record "${recordId}" from "${collection.name}":`, error); return { errors: [error.message] };
   }
 }
 
-console.log('Record service (record.service.ts) for dynamic collections created.');
+export async function getRecordById(
+  collectionName: string, recordId: string, authContext?: AuthUser | null, db?: Database
+): Promise<{ record?: Record<string, any>; errors?: string[] }> {
+  const dbInstance = db || getDB();
+  const collection = await collectionService.getCollectionByIdOrName(collectionName, dbInstance);
+  if (!collection) { return { errors: [`Collection "${collectionName}" not found.`] }; }
+  let viewRuleConditionSql = ''; let viewRuleParams: any[] = [];
+  if (collection.viewRule && collection.viewRule.trim() !== '') {
+    const ruleEval = ruleService.evaluateRule(collection.viewRule, { authRecord: authContext });
+    if (ruleEval.error) { return { errors: [ruleEval.error] }; }
+    if (ruleEval.allow === false || (ruleEval.condition && ruleEval.condition.sql === '1=0')) return { errors: ['Access denied by view rule.'] };
+    if (ruleEval.condition?.sql && ruleEval.condition.sql.trim() !== '' && ruleEval.condition.sql.trim() !== '1=1') { viewRuleConditionSql = ruleEval.condition.sql; viewRuleParams = ruleEval.condition.params; }
+  }
+  let query = `SELECT * FROM "${collection.name}" WHERE id = ?`; const queryParams: any[] = [recordId];
+  if (viewRuleConditionSql) { query += ` AND (${viewRuleConditionSql})`; queryParams.push(...viewRuleParams); }
+  query += `;`;
+  try {
+    const stmt = dbInstance.prepare(query); const recordDb = stmt.get(...queryParams) as Record<string, any>;
+    if (!recordDb) return { errors: [`Record ID "${recordId}" not found or not accessible.`] };
+    return { record: prepareRecordForEvent(recordDb, collection) };
+  } catch (error: any) { console.error(error); return { errors: [error.message] }; }
+}
+
+export async function listRecords(
+  collectionName: string, options?: { filter?: string; sort?: string; page?: number; perPage?: number },
+  authContext?: AuthUser | null, db?: Database
+): Promise<{ records?: Record<string, any>[]; totalItems?: number; page?: number; perPage?: number; totalPages?: number; errors?: string[] }> {
+  const dbInstance = db || getDB();
+  const collection = await collectionService.getCollectionByIdOrName(collectionName, dbInstance);
+  if (!collection) return { errors: [`Collection "${collectionName}" not found.`] };
+  let whereClauses: string[] = []; let queryParamsInternal: any[] = [];
+  if (collection.listRule && collection.listRule.trim() !== '') {
+    const ruleEval = ruleService.evaluateRule(collection.listRule, { authRecord: authContext });
+    if (ruleEval.error) return { errors: [ruleEval.error] };
+    if (ruleEval.allow === false || (ruleEval.condition?.sql === '1=0')) return { records: [], totalItems: 0, page: options?.page || 1, perPage: options?.perPage || 30, totalPages:0, errors: ['Access denied by list rule.'] };
+    if (ruleEval.condition?.sql && ruleEval.condition.sql.trim() !== '' && ruleEval.condition.sql.trim() !== '1=1') { whereClauses.push(`(${ruleEval.condition.sql})`); queryParamsInternal.push(...ruleEval.condition.params); }
+  }
+  let queryBase = `FROM "${collection.name}"`; if (whereClauses.length > 0) queryBase += ` WHERE ${whereClauses.join(' AND ')}`;
+  let query = `SELECT * ${queryBase}`; let countQuery = `SELECT COUNT(*) as total ${queryBase}`;
+  const perPage = options?.perPage || 30; const page = options?.page || 1; const offset = (page - 1) * perPage;
+  query += ` LIMIT ${perPage} OFFSET ${offset}`;
+  try {
+    const stmt = dbInstance.prepare(query); const recordsDb = stmt.all(...queryParamsInternal) as Record<string, any>[];
+    const countStmt = dbInstance.prepare(countQuery); const { total } = countStmt.get(...queryParamsInternal) as { total: number };
+    return { records: recordsDb.map(r => prepareRecordForEvent(r, collection)), totalItems: total, page, perPage, totalPages: Math.ceil(total / perPage) };
+  } catch (error: any) { console.error(error); return { errors: [error.message] }; }
+}
+
+console.log('Record service (record.service.ts) updated with granular before/after events for CUD operations.');

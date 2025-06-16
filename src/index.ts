@@ -5,6 +5,9 @@ import { paramsRoutes } from './routes/params'; // Import params routes
 import { uploadRoutes } from './routes/upload'; // Import upload routes
 import { collectionsSchemaRoutes } from './routes/collections'; // Import collections schema routes
 import { recordsRoutes } from './routes/records'; // Import records routes
+import { usersRoutes } from './routes/users'; // Import user profile routes
+import { registerUserListeners } from './listeners/user.listeners'; // Import user listeners
+import { registerApplicationCronJobs } from './services/cron.service'; // Import cron job registration
 
 const app = new Elysia();
 
@@ -12,9 +15,15 @@ const app = new Elysia();
 try {
   getDB(); // This will initialize the db if not already done
   console.log('Database connection established/checked.');
+
+  // Register application event listeners
+  registerUserListeners();
+
+  // Register and schedule cron jobs
+  registerApplicationCronJobs();
 } catch (e) {
-  console.error('Failed to initialize database:', e);
-  process.exit(1); // Exit if DB connection fails
+  console.error('Failed to initialize database, listeners, or cron jobs:', e); // Updated error message
+  process.exit(1);
 }
 
 // --- Hooks ---
@@ -42,6 +51,10 @@ app.group('/api/manage', (group) => collectionsSchemaRoutes(group));
 // Mount records routes (e.g., under /api)
 // This will result in routes like /api/collections/:collectionName/records
 app.group('/api', (group) => recordsRoutes(group));
+
+// Mount user profile routes (e.g., under /api)
+// This will result in routes like /api/users/me
+app.group('/api', (group) => usersRoutes(group));
 
 
 // --- Start Server ---
